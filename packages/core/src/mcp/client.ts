@@ -220,6 +220,8 @@ export interface CallToolResult {
   readonly isError: boolean
   readonly structured?: unknown
   readonly content: ReadonlyArray<CallToolContent>
+  /** The server's result as received, with `_meta` and content annotations. For hosts; never sent to the model. */
+  readonly original: SdkCallToolResult
 }
 
 export type ElicitationFormParams = ElicitRequestFormParams
@@ -1083,6 +1085,7 @@ function toCallToolResult(result: SdkCallToolResult): CallToolResult {
   return {
     isError: result.isError === true,
     structured: result.structuredContent,
+    original: result,
     content: result.content.flatMap((part): CallToolContent[] => {
       if (part.type === "text") return [{ type: "text", text: part.text }]
       if (part.type === "image" || part.type === "audio")

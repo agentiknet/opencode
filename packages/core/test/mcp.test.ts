@@ -2,7 +2,12 @@ import path from "node:path"
 import fs from "node:fs/promises"
 import os from "node:os"
 import { describe, expect, spyOn, test } from "bun:test"
-import { StreamableHTTPClientTransport, isJSONRPCRequest, type ListToolsResult } from "@modelcontextprotocol/client"
+import {
+  StreamableHTTPClientTransport,
+  isJSONRPCRequest,
+  type CallToolResult,
+  type ListToolsResult,
+} from "@modelcontextprotocol/client"
 import {
   createMcpHandler,
   inputRequired,
@@ -33,6 +38,7 @@ import { McpClient } from "@opencode/core/mcp/client"
 import { McpPool } from "@opencode/core/mcp/pool"
 import { McpStdio } from "@opencode/core/mcp/stdio"
 import { Permission } from "@opencode/core/permission"
+import { PluginHooks } from "@opencode/core/plugin/hooks"
 import { AbsolutePath } from "@opencode/core/schema"
 import { Session } from "@opencode/core/session"
 import { State } from "@opencode/core/state"
@@ -147,6 +153,8 @@ function resourceServer(
         missing: [] as string[],
         templateLists: 0,
         toolLists: 0,
+        /** Merged over every tool result, to return fields such as `_meta` or annotated content. */
+        toolResult: {} as Partial<CallToolResult>,
         toolCalls: [] as Array<{
           name: string
           arguments: Record<string, unknown> | undefined
@@ -275,7 +283,11 @@ function resourceServer(
             const structured = request.params.arguments?.structured
             const text = request.params.arguments?.text
             const content = typeof text === "string" ? [{ type: "text" as const, text }] : []
-            return Promise.resolve(structured === undefined ? { content } : { content, structuredContent: structured })
+            return Promise.resolve({
+              content,
+              ...(structured === undefined ? {} : { structuredContent: structured }),
+              ...state.toolResult,
+            })
           })
         }
         protocol.setRequestHandler("prompts/list", () => Promise.resolve({ prompts: [{ name: "greet" }] }))
@@ -565,6 +577,7 @@ const mcp = Layer.mock(Mcp.Service, {
         return {
           isError: true,
           content: [{ type: "text", text: "search index unavailable" }],
+          original: { isError: true, content: [{ type: "text", text: "search index unavailable" }] },
         } satisfies Mcp.ToolResult
       if (input.name === "media")
         return {
@@ -573,6 +586,12 @@ const mcp = Layer.mock(Mcp.Service, {
             { type: "text", text: "rendered chart" },
             { type: "media", data: "aGVsbG8=", mimeType: "image/png" },
           ],
+          original: {
+            content: [
+              { type: "text", text: "rendered chart" },
+              { type: "image", data: "aGVsbG8=", mimeType: "image/png" },
+            ],
+          },
         } satisfies Mcp.ToolResult
       if (input.name === "attachments")
         return {
@@ -591,26 +610,54 @@ const mcp = Layer.mock(Mcp.Service, {
               uri: "file:///data.parquet",
             },
           ],
+          original: {
+            content: [
+              {
+                type: "resource",
+                resource: {
+                  uri: "file:///README.md",
+                  mimeType: "text/markdown",
+                  blob: Buffer.from("# Notes").toString("base64"),
+                },
+              },
+              {
+                type: "resource",
+                resource: {
+                  uri: "file:///data.parquet",
+                  mimeType: "application/vnd.apache.parquet",
+                  blob: "UEFSMQ==",
+                },
+              },
+            ],
+          },
         } satisfies Mcp.ToolResult
       if (input.name === "status")
         return {
           isError: false,
           content: [{ type: "text", text: "hello" }],
+          original: { content: [{ type: "text", text: "hello" }] },
         } satisfies Mcp.ToolResult
       if (input.name === "issues" || input.name === "typed")
         return {
           isError: false,
           content: [{ type: "text", text: '{"issues":[{"id":1}]}' }],
+          original: { content: [{ type: "text", text: '{"issues":[{"id":1}]}' }] },
         } satisfies Mcp.ToolResult
       if (input.name === "count")
         return {
           isError: false,
           content: [{ type: "text", text: "42" }],
+          original: { content: [{ type: "text", text: "42" }] },
         } satisfies Mcp.ToolResult
       return {
         isError: false,
         structured: { ok: true },
         content: [],
+        original: {
+          content: [],
+          structuredContent: { ok: true },
+          _meta: { "example.test/private": "host-only-fixture" },
+        },
       } satisfies Mcp.ToolResult
     }),
 })
@@ -625,7 +672,7 @@ const permissions = permissionLayer({
 const events = Layer.mock(Bus.Service, { subscribe: () => Stream.never })
 const outputData = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-mcp-output-"))
 const it = testEffect(
-  AppNodeBuilder.build(LayerNode.group([Tool.node, McpTool.node]), [
+  AppNodeBuilder.build(LayerNode.group([Tool.node, McpTool.node, PluginHooks.node]), [
     ...toolNodeReplacements(permissions),
     Mcp.node.replace(mcp),
     Bus.node.replace(events),
@@ -670,6 +717,44 @@ test("passes session IDs as MCP request metadata", async () => {
           },
         ])
         expect(server.state.toolCalls[0]?.progressToken).not.toBe(server.state.toolCalls[1]?.progressToken)
+      }),
+    ),
+  )
+})
+
+test("keeps the original MCP tool result beside the normalized one", async () => {
+  await Effect.runPromise(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* resourceServer()
+        const original = {
+          content: [
+            { type: "text" as const, text: "shown", annotations: { audience: ["user" as const] } },
+            {
+              type: "resource_link" as const,
+              uri: "ui://widget/app.html",
+              name: "widget",
+              _meta: { "example.test/link": 1 },
+            },
+          ],
+          structuredContent: { ok: true },
+          _meta: { "example.test/private": "host-only-fixture", ui: { resourceUri: "ui://widget/app.html" } },
+        }
+        server.state.toolResult = original
+        const connection = yield* connect(
+          "original-result",
+          new ConfigMCP.Remote({ type: "remote", url: server.url, oauth: false }),
+          import.meta.dir,
+        )
+        const result = yield* connection.callTool({ name: "echo" })
+
+        expect(result.isError).toBe(false)
+        expect(result.structured).toEqual({ ok: true })
+        expect(result.content).toEqual([
+          { type: "text", text: "shown" },
+          { type: "text", text: "ui://widget/app.html" },
+        ])
+        expect(result.original).toEqual(original)
       }),
     ),
   )
@@ -1274,12 +1359,13 @@ describe.each([
           )
           yield* connection.tools()
 
-          expect(yield* connection.callTool({ name: "delete", args: { text: "Meeting deleted." } })).toEqual({
+          // A modern server adds its own `_meta` to the original result, so only the normalized fields are compared.
+          expect(yield* connection.callTool({ name: "delete", args: { text: "Meeting deleted." } })).toMatchObject({
             isError: false,
             structured: undefined,
             content: [{ type: "text", text: "Meeting deleted." }],
           })
-          expect(yield* connection.callTool({ name: "delete" })).toEqual({
+          expect(yield* connection.callTool({ name: "delete" })).toMatchObject({
             isError: false,
             structured: undefined,
             content: [],
@@ -2559,6 +2645,7 @@ testEffect(Layer.empty).live("preserves plugin transforms through MCP catalog up
                   Effect.succeed({
                     isError: false,
                     content: [{ type: "text", text: "healthy" }],
+                    original: { content: [{ type: "text", text: "healthy" }] },
                   } satisfies Mcp.ToolResult),
               }),
             ),
@@ -2756,6 +2843,57 @@ it.effect("forwards the invoking session through direct and Code Mode MCP tools"
       args: {},
       sessionID: codeModeSessionID,
     })
+  }),
+)
+
+it.effect("gives tool hooks the original MCP result without sending it to the model", () =>
+  Effect.gen(function* () {
+    assertion = yield* Deferred.make<Permission.AssertInput>()
+    decision = Effect.void
+    const registry = yield* Tool.Service
+    const hooks = yield* PluginHooks.Service
+    const registration = yield* McpTool.Service
+    yield* registration.flush
+    const seen: Array<{ codemode: boolean; metadata: unknown }> = []
+    yield* hooks.register("tool", "execute.after", (event) =>
+      Effect.sync(() => {
+        if (event.status !== "completed" || event.tool === "execute") return
+        seen.push({ codemode: event.codemode, metadata: event.result.metadata })
+      }),
+    )
+    const metadata = {
+      mcp: {
+        content: [],
+        structuredContent: { ok: true },
+        _meta: { "example.test/private": "host-only-fixture" },
+      },
+    }
+
+    const direct = yield* executeTool(registry, {
+      sessionID: Session.ID.make("ses_mcp_original_direct"),
+      ...toolIdentity,
+      call: { type: "tool-call", id: "call_mcp_original_direct", name: "direct_lookup", input: {} },
+    })
+    const program = yield* executeTool(registry, {
+      sessionID: Session.ID.make("ses_mcp_original_codemode"),
+      ...toolIdentity,
+      call: {
+        type: "tool-call",
+        id: "call_mcp_original_codemode",
+        name: "execute",
+        input: { code: "return await tools.demo.search({})" },
+      },
+    })
+
+    expect(seen).toEqual([
+      { codemode: false, metadata },
+      { codemode: true, metadata },
+    ])
+    expect(direct.output).toEqual({ ok: true })
+    expect(direct.metadata).toEqual(metadata)
+    expect(JSON.stringify([direct.output, direct.content])).not.toContain("host-only-fixture")
+    expect(program.output).toMatchObject({ output: JSON.stringify({ ok: true }) })
+    expect(JSON.stringify(program)).not.toContain("host-only-fixture")
   }),
 )
 

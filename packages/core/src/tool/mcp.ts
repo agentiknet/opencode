@@ -102,6 +102,8 @@ export const layer = Layer.effect(
                     return {
                       output: output(),
                       ...(content.length === 0 ? {} : { content }),
+                      // Hosts read the server's own result here, such as `_meta`; the model only sees output and content.
+                      metadata: { mcp: result.original },
                     }
                   }).pipe(
                     Effect.mapError((error) => {
