@@ -1,6 +1,7 @@
 import type { McpApi } from "@opencode/client/promise/api"
 import type { Mcp } from "@opencode/schema/mcp"
 import type { Types } from "effect"
+import type { CallToolInput, CallToolResult, ReadResourceInput, ReadResourceResult } from "../mcp.js"
 import type { Transform } from "./registration.js"
 
 export interface MCPEditor {
@@ -14,4 +15,17 @@ export interface MCPEditor {
 export interface MCPDomain extends Pick<McpApi, "list"> {
   readonly transform: Transform<MCPEditor>
   readonly reload: () => Promise<void>
+  /**
+   * Calls a tool on a connected MCP server over the connection and credentials OpenCode already holds.
+   * Asks the session's permission rules first, under the same action as a model call of that tool.
+   * Resolves with the server's result as sent, `_meta` included, also when it reports `isError`. A
+   * deny rule, an unknown or disconnected server, or a failed request rejects with a `Tool.Error`.
+   */
+  readonly callTool: (input: typeof CallToolInput.Encoded) => Promise<CallToolResult>
+  /**
+   * Reads a resource from a connected MCP server over the connection OpenCode already holds, such as
+   * a `ui://` resource. Asks the session's permission rules first, under the `read_mcp_resource`
+   * tool's action. Resolves with the server's result as sent, `_meta` included.
+   */
+  readonly readResource: (input: typeof ReadResourceInput.Encoded) => Promise<ReadResourceResult>
 }

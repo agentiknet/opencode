@@ -6,6 +6,7 @@ import { Effect, Schema, SchemaAST, Stream } from "effect"
 import type { Scope } from "effect"
 import { HttpApiEndpoint, HttpApiSchema } from "effect/http-api"
 import { define } from "../effect/plugin.js"
+import { CallToolInput, ReadResourceInput } from "../mcp.js"
 import { AssertInput } from "../permission.js"
 import type { Plugin } from "./plugin.js"
 import type { Info, ToolHooks } from "./tool.js"
@@ -533,6 +534,10 @@ export function fromPromise(plugin: Plugin) {
             list: adaptApiMethod(McpEndpoints["mcp.list"], host.mcp.list),
             transform: transform(host.mcp),
             reload: () => run(host.mcp.reload()),
+            callTool: (input) =>
+              run(Schema.decodeUnknownEffect(CallToolInput)(input).pipe(Effect.flatMap(host.mcp.callTool))),
+            readResource: (input) =>
+              run(Schema.decodeUnknownEffect(ReadResourceInput)(input).pipe(Effect.flatMap(host.mcp.readResource))),
           },
           permission: {
             hook: (name, callback) =>

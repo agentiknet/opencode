@@ -80,6 +80,8 @@ export const ResourceCatalog = Mcp.ResourceCatalog
 export type ResourceCatalog = Mcp.ResourceCatalog
 export const ResourceContent = Mcp.ResourceContent
 export type ResourceContent = Mcp.ResourceContent
+/** Resource contents with the server's result as received, which keeps `_meta`. `original` is for hosts, not the model. */
+export type ResourceRead = ResourceContent & { readonly original: McpClient.ReadResourceResult }
 
 export class NotFoundError extends Schema.TaggedError<NotFoundError>()("MCP.NotFoundError", {
   server: ServerName,
@@ -209,7 +211,7 @@ export interface Interface extends State.Transformable<Editor> {
   readonly readResource: (input: {
     readonly server: ServerName | string
     readonly uri: string
-  }) => Effect.Effect<ResourceContent | undefined, Error>
+  }) => Effect.Effect<ResourceRead | undefined, Error>
   /** Experimental: skills that connected servers list through MCP Skills. */
   readonly skills: () => Effect.Effect<Skill[]>
   /**
@@ -1174,15 +1176,18 @@ export const layer = (options?: Options) =>
             connection.readResource({ uri: input.uri }),
           )
           if (!result) return undefined
-          return ResourceContent.make({
-            server: name,
-            uri: input.uri,
-            contents: result.contents.map((part) =>
-              "text" in part
-                ? { type: "text", uri: part.uri, text: part.text, mimeType: part.mimeType }
-                : { type: "blob", uri: part.uri, blob: part.blob, mimeType: part.mimeType },
-            ),
-          })
+          return {
+            ...ResourceContent.make({
+              server: name,
+              uri: input.uri,
+              contents: result.contents.map((part) =>
+                "text" in part
+                  ? { type: "text", uri: part.uri, text: part.text, mimeType: part.mimeType }
+                  : { type: "blob", uri: part.uri, blob: part.blob, mimeType: part.mimeType },
+              ),
+            }),
+            original: result,
+          }
         }),
         skills: Effect.fn("MCP.skills")(function* () {
           return Array.from(entries).flatMap(([server, entry]) =>

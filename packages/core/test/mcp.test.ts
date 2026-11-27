@@ -38,7 +38,11 @@ import { McpClient } from "@opencode/core/mcp/client"
 import { McpPool } from "@opencode/core/mcp/pool"
 import { McpStdio } from "@opencode/core/mcp/stdio"
 import { Permission } from "@opencode/core/permission"
+import { Plugin } from "@opencode/core/plugin"
 import { PluginHooks } from "@opencode/core/plugin/hooks"
+import { PluginHost } from "@opencode/core/plugin/host"
+import { PluginPromise } from "@opencode/core/plugin/promise"
+import type { MCPDomain } from "@opencode/plugin/promise/mcp"
 import { AbsolutePath } from "@opencode/core/schema"
 import { Session } from "@opencode/core/session"
 import { State } from "@opencode/core/state"
@@ -81,6 +85,7 @@ import { permissionLayer } from "./lib/permission"
 import { registerIntegrationPolicy, setOrganizationPolicy } from "./fixture/policy"
 import { location } from "./fixture/location"
 import { host } from "./plugin/host"
+import { makePluginTestLayer } from "./plugin/fixture"
 import { tmpdirScoped } from "./fixture/tmpdir"
 import { hostEnvironmentLayer, recordingEnvironmentLayer } from "./fixture/environment"
 import {
@@ -146,7 +151,11 @@ function resourceServer(
         contents: [
           { uri: "docs://readme", text: "hello", mimeType: "text/plain" },
           { uri: "docs://logo", blob: "aGVsbG8=", mimeType: "image/png" },
-        ] as Array<{ uri: string; text: string; mimeType?: string } | { uri: string; blob: string; mimeType?: string }>,
+        ] as Array<
+          { uri: string; mimeType?: string; _meta?: Record<string, unknown> } & ({ text: string } | { blob: string })
+        >,
+        /** Sent as the `_meta` of every resource read result. */
+        resourceMeta: undefined as Record<string, unknown> | undefined,
         resourceLists: 0,
         resourceReads: [] as string[],
         templatesUnsupported: false,
@@ -311,7 +320,10 @@ function resourceServer(
           protocol.setRequestHandler("resources/read", (request) => {
             state.resourceReads.push(request.params.uri)
             if (state.missing.includes(request.params.uri)) return Promise.reject(new Error("Resource not found"))
-            return Promise.resolve({ contents: state.contents })
+            return Promise.resolve({
+              contents: state.contents,
+              ...(state.resourceMeta === undefined ? {} : { _meta: state.resourceMeta }),
+            })
           })
         }
         return protocol
@@ -1633,10 +1645,125 @@ test("loads and reads MCP resources", async () => {
               { type: "text", uri: "docs://readme", text: "hello", mimeType: "text/plain" },
               { type: "blob", uri: "docs://logo", blob: "aGVsbG8=", mimeType: "image/png" },
             ],
+            original: {
+              contents: [
+                { uri: "docs://readme", text: "hello", mimeType: "text/plain" },
+                { uri: "docs://logo", blob: "aGVsbG8=", mimeType: "image/png" },
+              ],
+            },
           })
           expect(server.clientVersion()).toMatchObject({ name: "sdk", version: "1.2.3" })
         }).pipe(
           Effect.provide(resourceMcpLayer(server.url, undefined, { clientInfo: { name: "sdk", version: "1.2.3" } })),
+        )
+      }),
+    ),
+  )
+})
+
+test("lets plugins call tools and read resources on the connections OpenCode holds", async () => {
+  const asserted: Permission.AssertInput[] = []
+  let verdict: Effect.Effect<void, Permission.Error> = Effect.void
+  const permission = permissionLayer({
+    assert: (input) => Effect.suspend(() => (asserted.push(input), verdict)),
+  })
+  const sessionID = Session.ID.make("ses_plugin_mcp")
+  const tool = {
+    content: [{ type: "text" as const, text: "three tasks" }],
+    structuredContent: { tasks: 3 },
+    _meta: { "example.test/private": "host-only-fixture", ui: { resourceUri: "ui://tasks/app.html" } },
+  }
+  const resource = {
+    contents: [
+      {
+        uri: "ui://tasks/app.html",
+        text: "<html></html>",
+        mimeType: "text/html;profile=mcp-app",
+        _meta: { ui: { csp: { connectDomains: ["https://example.test"] } } },
+      },
+    ],
+    _meta: { "example.test/private": "host-only-fixture" },
+  }
+  await Effect.runPromise(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* resourceServer()
+        server.state.toolResult = tool
+        server.state.contents = resource.contents
+        server.state.resourceMeta = resource._meta
+
+        yield* Effect.gen(function* () {
+          yield* settled(yield* Mcp.Service)
+          const context = yield* PluginHost.make(yield* Plugin.Service, "test")
+
+          expect(
+            yield* context.mcp.callTool({ sessionID, server: "resources", name: "echo", args: { list: "today" } }),
+          ).toEqual(tool)
+          expect(server.state.toolCalls).toMatchObject([
+            { name: "echo", arguments: { list: "today" }, sessionID: "ses_plugin_mcp" },
+          ])
+          expect(
+            yield* context.mcp.readResource({ sessionID, server: "resources", uri: "ui://tasks/app.html" }),
+          ).toEqual(resource)
+          expect(server.state.resourceReads).toEqual(["ui://tasks/app.html"])
+          expect(server.state.initializations).toBe(1)
+          // The same requests a model call of the tool and of read_mcp_resource makes.
+          expect(asserted).toEqual([
+            {
+              sessionID,
+              agent: undefined,
+              action: "resources_echo",
+              resources: ["*"],
+              save: ["*"],
+              metadata: { input: { list: "today" } },
+            },
+            {
+              sessionID,
+              agent: undefined,
+              action: "opencode_read_mcp_resource",
+              resources: ["resources:ui://tasks/app.html"],
+              save: ["resources:*"],
+              metadata: { server: "resources", uri: "ui://tasks/app.html" },
+            },
+          ])
+
+          let domain: MCPDomain | undefined
+          yield* PluginPromise.fromPromise({
+            id: "promise-mcp",
+            async setup(promised) {
+              domain = promised.mcp
+            },
+          }).effect(context)
+          expect(
+            yield* Effect.promise(() =>
+              domain!.readResource({ sessionID: "ses_plugin_mcp", server: "resources", uri: "ui://tasks/app.html" }),
+            ),
+          ).toEqual(resource)
+          expect(
+            yield* Effect.promise(() =>
+              domain!.callTool({ sessionID: "ses_plugin_mcp", server: "resources", name: "echo" }),
+            ),
+          ).toEqual(tool)
+
+          const unknown = yield* context.mcp.callTool({ sessionID, server: "missing", name: "echo" }).pipe(Effect.flip)
+          expect(unknown).toBeInstanceOf(Tool.Error)
+          expect(unknown.message).toBe("MCP server not found: missing")
+
+          // A denied request never reaches the server.
+          verdict = Effect.fail(
+            new Permission.BlockedError({ rules: [], permission: "resources_echo", resources: ["*"] }),
+          )
+          const requests = { calls: server.state.toolCalls.length, reads: server.state.resourceReads.length }
+          const call = yield* context.mcp.callTool({ sessionID, server: "resources", name: "echo" }).pipe(Effect.flip)
+          const read = yield* context.mcp
+            .readResource({ sessionID, server: "resources", uri: "ui://tasks/app.html" })
+            .pipe(Effect.flip)
+          expect(call).toBeInstanceOf(Tool.Error)
+          expect(call.error).toBeInstanceOf(Permission.BlockedError)
+          expect(read.error).toBeInstanceOf(Permission.BlockedError)
+          expect({ calls: server.state.toolCalls.length, reads: server.state.resourceReads.length }).toEqual(requests)
+        }).pipe(
+          Effect.provide(makePluginTestLayer(permission, undefined, [Mcp.node.replace(resourceMcpLayer(server.url))])),
         )
       }),
     ),

@@ -188,3 +188,7 @@ ctx.tool.reload()
 ctx.vcs.reload()
 ctx.websearch.reload()
 ```
+
+`ctx.mcp.callTool({ sessionID, server, name, args })` and `ctx.mcp.readResource({ sessionID, server, uri })` use the
+MCP connections and credentials OpenCode already holds. Both ask the session's permission rules first, under the same
+action a model call asks under, and return the server's result as sent, including `_meta`.

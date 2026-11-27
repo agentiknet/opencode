@@ -54,6 +54,8 @@ export const registerIntegrationPolicy = Effect.fn(function* (input: {
         list: () => Effect.die("unused mcp.list"),
         transform: (callback) => input.mcp?.transform(callback) ?? Effect.succeed({ dispose: Effect.void }),
         reload: () => input.mcp?.reload() ?? Effect.void,
+        callTool: () => Effect.die("unused mcp.callTool"),
+        readResource: () => Effect.die("unused mcp.readResource"),
       },
       skill: {
         list: () => Effect.die("unused skill.list"),

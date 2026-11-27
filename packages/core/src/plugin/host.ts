@@ -31,6 +31,7 @@ import { Rpc } from "../rpc.js"
 import { AbsolutePath, type DeepMutable } from "../schema.js"
 import { Skill } from "../skill.js"
 import { Tool } from "../tool.js"
+import { McpTool } from "../tool/mcp.js"
 import { Workspace } from "../workspace.js"
 import { Vcs } from "../vcs.js"
 import { WebSearch } from "../websearch.js"
@@ -107,6 +108,16 @@ export const make = Effect.fn("PluginHost.make")(function* (plugin: Pick<Interfa
       return { location: locationInfo(yield* Location.Service), data: yield* effect }
     }).pipe(Effect.provide(locations.get(ref)))
 
+  // Plain rejections stay defects, as for built-in tools, so they end the step.
+  const assertPermission = (input: Permission.AssertInput) =>
+    permission.assert(input).pipe(
+      Effect.catchTags({
+        "Permission.BlockedError": (error) => Effect.fail(new Tool.Error({ message: error.message, error })),
+        "Permission.CorrectedError": (error) => Effect.fail(new Tool.Error({ message: error.feedback, error })),
+        "Session.NotFoundError": (error) =>
+          Effect.fail(new Tool.Error({ message: `Session not found: ${error.sessionID}`, error })),
+      }),
+    )
   const sessionPermission = (input: Parameters<Plugin.Context["permission"]["get"]>[0]) =>
     permission
       .get(input.requestID)
@@ -459,6 +470,47 @@ export const make = Effect.fn("PluginHost.make")(function* (plugin: Pick<Interfa
             remove: editor.remove,
           })
         }),
+      // Plugin calls ask under the actions a model call of the same tool or resource read asks under.
+      callTool: (input) =>
+        assertPermission({
+          sessionID: input.sessionID,
+          agent: input.agent,
+          action: McpTool.name(input.server, input.name),
+          resources: ["*"],
+          save: ["*"],
+          metadata: { input: input.args ?? {} },
+        }).pipe(
+          Effect.andThen(
+            mcp
+              .callTool({ server: input.server, name: input.name, args: input.args, sessionID: input.sessionID })
+              .pipe(Effect.mapError((error) => new Tool.Error({ message: error.message, error }))),
+          ),
+          Effect.map((result) => result.original),
+        ),
+      readResource: (input) =>
+        assertPermission({
+          sessionID: input.sessionID,
+          agent: input.agent,
+          action: "opencode_read_mcp_resource",
+          resources: [`${input.server}:${input.uri}`],
+          save: [`${input.server}:*`],
+          metadata: { server: input.server, uri: input.uri },
+        }).pipe(
+          Effect.andThen(
+            mcp
+              .readResource({ server: input.server, uri: input.uri })
+              .pipe(Effect.mapError((error) => new Tool.Error({ message: error.message, error }))),
+          ),
+          Effect.flatMap((resource) =>
+            resource
+              ? Effect.succeed(resource.original)
+              : Effect.fail(
+                  new Tool.Error({
+                    message: `MCP server "${input.server}" is not connected or does not expose resources`,
+                  }),
+                ),
+          ),
+        ),
     },
     permission: {
       hook: (name, callback) => hooks.register("permission", name, callback),
@@ -470,16 +522,7 @@ export const make = Effect.fn("PluginHost.make")(function* (plugin: Pick<Interfa
             permission.reply({ requestID: input.requestID, reply: input.decision, message: input.message }),
           ),
         ),
-      // Plain rejections stay defects, as for built-in tools, so they end the step.
-      assert: (input) =>
-        permission.assert(input).pipe(
-          Effect.catchTags({
-            "Permission.BlockedError": (error) => Effect.fail(new Tool.Error({ message: error.message, error })),
-            "Permission.CorrectedError": (error) => Effect.fail(new Tool.Error({ message: error.feedback, error })),
-            "Session.NotFoundError": (error) =>
-              Effect.fail(new Tool.Error({ message: `Session not found: ${error.sessionID}`, error })),
-          }),
-        ),
+      assert: assertPermission,
     },
     plugin: {
       list: () => response(plugin.list()),
